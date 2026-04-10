@@ -115,8 +115,12 @@ struct ProjectStats {
 }
 
 impl ProjectStats {
+    fn uncached_input_tokens(&self) -> u64 {
+        self.input_tokens.saturating_sub(self.cached_input_tokens)
+    }
+
     fn total_tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens
+        self.uncached_input_tokens() + self.output_tokens
     }
 
     fn accumulate(&mut self, other: &ProjectStats) {
@@ -302,8 +306,7 @@ fn stats_row(rank: &str, name: &str, stats: &ProjectStats, bold_all: bool) -> Ve
         attr(Cell::new(rank)),
         attr(Cell::new(name)),
         attr(Cell::new(stats.sessions)),
-        attr(Cell::new(format_tokens(stats.input_tokens))),
-        attr(Cell::new(format_tokens(stats.cached_input_tokens))),
+        attr(Cell::new(format_tokens(stats.uncached_input_tokens()))),
         attr(Cell::new(format_tokens(stats.output_tokens))),
         attr(Cell::new(format_tokens(stats.reasoning_tokens))),
         attr(Cell::new(format_tokens(stats.total_tokens()))
@@ -318,7 +321,7 @@ fn print_leaderboard(sorted: &[(String, ProjectStats)], period: Period) {
 
     let mut table = Table::new();
     table.set_header(
-        ["#", "Project", "Sessions", "Input", "Cached", "Output", "Reasoning", "Total", "Cost*"]
+        ["#", "Project", "Sessions", "Uncached", "Output", "Reasoning", "Total", "Cost*"]
             .map(|h| Cell::new(h).add_attribute(Attribute::Bold)),
     );
 
