@@ -171,48 +171,75 @@ fn collect_session_files(base: &Path, cutoff: Option<(u32, u32, u32)>) -> Vec<Pa
     };
 
     for year_entry in years.flatten() {
-        if !year_entry.path().is_dir() {
-            continue;
-        }
-        let year_name = year_entry.file_name().to_string_lossy().to_string();
-
-        let Ok(months) = fs::read_dir(year_entry.path()) else {
-            continue;
-        };
-        for month_entry in months.flatten() {
-            if !month_entry.path().is_dir() {
-                continue;
-            }
-            let month_name = month_entry.file_name().to_string_lossy().to_string();
-
-            let Ok(days) = fs::read_dir(month_entry.path()) else {
-                continue;
-            };
-            for day_entry in days.flatten() {
-                if !day_entry.path().is_dir() {
-                    continue;
-                }
-                let day_name = day_entry.file_name().to_string_lossy().to_string();
-
-                if let Some(cutoff) = cutoff {
-                    if !date_dir_in_range(&year_name, &month_name, &day_name, cutoff) {
-                        continue;
-                    }
-                }
-
-                let Ok(sessions) = fs::read_dir(day_entry.path()) else {
-                    continue;
-                };
-                for session in sessions.flatten() {
-                    let path = session.path();
-                    if path.extension().is_some_and(|e| e == "jsonl") {
-                        files.push(path);
-                    }
-                }
-            }
-        }
+        collect_year_session_files(&year_entry, cutoff, &mut files);
     }
     files
+}
+
+fn collect_year_session_files(
+    year_entry: &fs::DirEntry,
+    cutoff: Option<(u32, u32, u32)>,
+    files: &mut Vec<PathBuf>,
+) {
+    if !year_entry.path().is_dir() {
+        return;
+    }
+    let year_name = year_entry.file_name().to_string_lossy().to_string();
+    let Ok(months) = fs::read_dir(year_entry.path()) else {
+        return;
+    };
+    for month_entry in months.flatten() {
+        collect_month_session_files(&year_name, &month_entry, cutoff, files);
+    }
+}
+
+fn collect_month_session_files(
+    year_name: &str,
+    month_entry: &fs::DirEntry,
+    cutoff: Option<(u32, u32, u32)>,
+    files: &mut Vec<PathBuf>,
+) {
+    if !month_entry.path().is_dir() {
+        return;
+    }
+    let month_name = month_entry.file_name().to_string_lossy().to_string();
+    let Ok(days) = fs::read_dir(month_entry.path()) else {
+        return;
+    };
+    for day_entry in days.flatten() {
+        collect_day_session_files(year_name, &month_name, &day_entry, cutoff, files);
+    }
+}
+
+fn collect_day_session_files(
+    year_name: &str,
+    month_name: &str,
+    day_entry: &fs::DirEntry,
+    cutoff: Option<(u32, u32, u32)>,
+    files: &mut Vec<PathBuf>,
+) {
+    if !day_entry.path().is_dir() {
+        return;
+    }
+    let day_name = day_entry.file_name().to_string_lossy().to_string();
+    if let Some(cutoff_date) = cutoff
+        && !date_dir_in_range(year_name, month_name, &day_name, cutoff_date)
+    {
+        return;
+    }
+    collect_jsonl_files(&day_entry.path(), files);
+}
+
+fn collect_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(sessions) = fs::read_dir(dir) else {
+        return;
+    };
+    for session in sessions.flatten() {
+        let path = session.path();
+        if path.extension().is_some_and(|e| e == "jsonl") {
+            files.push(path);
+        }
+    }
 }
 
 fn process_session(path: &Path) -> Option<(String, ProjectStats)> {
@@ -222,43 +249,62 @@ fn process_session(path: &Path) -> Option<(String, ProjectStats)> {
     let mut last_usage: Option<TokenUsage> = None;
 
     for line in content.lines() {
-        let Ok(entry) = serde_json::from_str::<LogEntry>(line) else {
-            continue;
-        };
-
-        match entry.r#type.as_str() {
-            "session_meta" => {
-                if let Ok(meta) = serde_json::from_value::<SessionMeta>(entry.payload) {
-                    cwd = meta.cwd;
-                }
-            }
-            "event_msg" => {
-                if let Ok(tc) = serde_json::from_value::<TokenCountPayload>(entry.payload) {
-                    if tc.r#type == "token_count" {
-                        if let Some(info) = tc.info {
-                            last_usage = Some(info.total_token_usage);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
+        process_session_line(line, &mut cwd, &mut last_usage);
     }
 
     let usage = last_usage?;
-    let project = cwd
-        .map(|c| normalize_cwd(&c))
-        .unwrap_or_else(|| "unknown".to_string());
+    let project = resolve_project_name(cwd);
+    let stats = stats_from_usage(usage);
 
-    let stats = ProjectStats {
+    Some((project, stats))
+}
+
+fn process_session_line(
+    line: &str,
+    cwd: &mut Option<String>,
+    last_usage: &mut Option<TokenUsage>,
+) {
+    let Ok(entry) = serde_json::from_str::<LogEntry>(line) else {
+        return;
+    };
+    match entry.r#type.as_str() {
+        "session_meta" => update_cwd_from_meta(entry.payload, cwd),
+        "event_msg" => update_usage_from_event(entry.payload, last_usage),
+        _ => {}
+    }
+}
+
+fn update_cwd_from_meta(payload: serde_json::Value, cwd: &mut Option<String>) {
+    if let Ok(meta) = serde_json::from_value::<SessionMeta>(payload) {
+        *cwd = meta.cwd;
+    }
+}
+
+fn update_usage_from_event(payload: serde_json::Value, last_usage: &mut Option<TokenUsage>) {
+    let Ok(tc) = serde_json::from_value::<TokenCountPayload>(payload) else {
+        return;
+    };
+    if tc.r#type != "token_count" {
+        return;
+    }
+    if let Some(info) = tc.info {
+        *last_usage = Some(info.total_token_usage);
+    }
+}
+
+fn resolve_project_name(cwd: Option<String>) -> String {
+    cwd.map(|c| normalize_cwd(&c))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn stats_from_usage(usage: TokenUsage) -> ProjectStats {
+    ProjectStats {
         input_tokens: usage.input_tokens,
         cached_input_tokens: usage.cached_input_tokens,
         output_tokens: usage.output_tokens,
         reasoning_tokens: usage.reasoning_output_tokens,
         sessions: 1,
-    };
-
-    Some((project, stats))
+    }
 }
 
 fn format_tokens(n: u64) -> String {
